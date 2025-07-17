@@ -20,14 +20,17 @@ use vulkano::{
         physical::{self, PhysicalDeviceType},
         Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo,
     },
-    image::{view::ImageView, ImageAccess, ImageUsage, SwapchainImage},
+    image::{view::ImageView, ImageUsage},
     instance::{Instance, InstanceCreateInfo},
-    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass},
+    render_pass::{
+        AttachmentDescription, AttachmentLoadOp, AttachmentReference, AttachmentStoreOp,
+        Framebuffer, FramebufferCreateInfo, RenderPass, RenderPassCreateInfo, SubpassDescription,
+    },
     swapchain::{
-        acquire_next_image, AcquireError, Swapchain, SwapchainCreateInfo, SwapchainCreationError,
+        acquire_next_image, Swapchain, SwapchainCreateInfo,
         SwapchainPresentInfo,
     },
-    sync::{self, FlushError, GpuFuture},
+    sync::{self, GpuFuture},
     VulkanLibrary,
 };
 use vulkano_win::{create_surface_from_winit, VkSurfaceBuild};
@@ -42,8 +45,6 @@ fn main() {
     let instance = Instance::new(
         library,
         InstanceCreateInfo {
-            // Enable enumerating ports for surfaces, can be useful for debugging.
-            enumerate_portability: true,
             ..Default::default()
         },
     )
@@ -51,7 +52,7 @@ fn main() {
 
     let event_loop = EventLoop::new();
     let window = Arc::new(WindowBuilder::new().build(&event_loop).unwrap());
-    let surface = create_surface_from_winit(window.clone(), instance.clone()).unwrap();
+    let surface = vulkano_win::create_surface_from_winit(window.clone(), instance.clone()).unwrap();
 
     let device_extensions = DeviceExtensions {
         khr_swapchain: true,
@@ -66,7 +67,8 @@ fn main() {
                     .iter()
                     .enumerate()
                     .position(|(i, q)| {
-                        q.queue_flags.graphics && p.surface_support(i as u32, &surface).unwrap_or(false)
+                    q.queue_flags.intersects(vulkano::device::QueueFlags::GRAPHICS)
+                        && p.surface_support(i as u32, &surface).unwrap_or(false)
                     })
                     .map(|i| (p, i as u32))
             })
@@ -78,7 +80,7 @@ fn main() {
                     PhysicalDeviceType::VirtualGpu => 2,
                     PhysicalDeviceType::Cpu => 3,
                     PhysicalDeviceType::Other => 4,
-                    _ => 5,
+                _ => 5,
                 }
             })
             .expect("no suitable physical device found");
@@ -109,13 +111,11 @@ fn main() {
             .physical_device()
             .surface_capabilities(&surface, Default::default())
             .unwrap();
-        let image_format = Some(
-            device
-                .physical_device()
-                .surface_formats(&surface, Default::default())
-                .unwrap()[0]
-                .0,
-        );
+        let image_format = device
+            .physical_device()
+            .surface_formats(&surface, Default::default())
+            .unwrap()[0]
+            .0;
         let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
 
         Swapchain::new(
@@ -125,18 +125,8 @@ fn main() {
                 min_image_count: surface_capabilities.min_image_count,
                 image_format,
                 image_extent: window.inner_size().into(),
-                image_usage: ImageUsage {
-                    color_attachment: true,
-                    ..Default::default()
-                },
-                composite_alpha: {
-                    let alpha = surface_capabilities.supported_composite_alpha;
-                    if alpha.supports(vulkano::swapchain::CompositeAlpha::Opaque) {
-                        vulkano::swapchain::CompositeAlpha::Opaque
-                    } else {
-                        vulkano::swapchain::CompositeAlpha::Inherit
-                    }
-                },
+                image_usage: ImageUsage::COLOR_ATTACHMENT,
+                composite_alpha: vulkano::swapchain::CompositeAlpha::Opaque,
                 ..Default::default()
             },
         )
@@ -178,8 +168,7 @@ fn main() {
                             ..swapchain.create_info()
                         }) {
                             Ok(r) => r,
-                            Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return,
-                            Err(e) => panic!("failed to recreate swapchain: {e}"),
+                            Err(_e) => panic!("failed to recreate swapchain"),
                         };
 
                     swapchain = new_swapchain;
@@ -190,11 +179,10 @@ fn main() {
                 let (image_index, suboptimal, acquire_future) =
                     match acquire_next_image(swapchain.clone(), None) {
                         Ok(r) => r,
-                        Err(AcquireError::OutOfDate) => {
+                        Err(_e) => {
                             recreate_swapchain = true;
                             return;
                         }
-                        Err(e) => panic!("failed to acquire next image: {e}"),
                     };
 
                 if suboptimal {
@@ -210,20 +198,28 @@ fn main() {
                 )
                 .unwrap();
 
-                let render_pass = vulkano::single_pass_renderpass!(
+                let render_pass = RenderPass::new(
                     device.clone(),
-                    attachments: {
-                        color: {
-                            load: Clear,
-                            store: Store,
+                    RenderPassCreateInfo {
+                        attachments: vec![AttachmentDescription {
                             format: swapchain.image_format(),
-                            samples: 1,
-                        }
+                            samples: vulkano::image::SampleCount::Sample1,
+                            load_op: AttachmentLoadOp::Clear,
+                            store_op: AttachmentStoreOp::Store,
+                            ..Default::default()
+                        }],
+                        subpasses: vec![SubpassDescription {
+                            color_attachments: vec![Some(AttachmentReference {
+                                attachment: 0,
+                                layout: vulkano::image::ImageLayout::ColorAttachmentOptimal,
+                                aspects: vulkano::image::ImageAspects::COLOR,
+                                stencil_layout: None,
+                                _ne: unsafe { std::mem::zeroed() },
+                            })],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
                     },
-                    pass: {
-                        color: [color],
-                        depth_stencil: {}
-                    }
                 )
                 .unwrap();
 
@@ -250,10 +246,10 @@ fn main() {
                                 framebuffers[image_index as usize].clone(),
                             )
                         },
-                        SubpassContents::Inline,
+                        Default::default(),
                     )
                     .unwrap()
-                    .end_render_pass()
+                    .end_render_pass(Default::default())
                     .unwrap();
 
                 let command_buffer = builder.build().unwrap();
@@ -274,12 +270,8 @@ fn main() {
                     Ok(future) => {
                         previous_frame_end = Some(future.boxed());
                     }
-                    Err(FlushError::OutOfDate) => {
+                    Err(_e) => {
                         recreate_swapchain = true;
-                        previous_frame_end = Some(sync::now(device.clone()).boxed());
-                    }
-                    Err(e) => {
-                        println!("failed to flush future: {e}");
                         previous_frame_end = Some(sync::now(device.clone()).boxed());
                     }
                 }
