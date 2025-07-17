@@ -28,8 +28,9 @@ use vulkano::{
         SwapchainPresentInfo,
     },
     sync::{self, FlushError, GpuFuture},
+    VulkanLibrary,
 };
-use vulkano_win::VkSurfaceBuild;
+use vulkano_win::{create_surface_from_winit, VkSurfaceBuild};
 use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
@@ -37,27 +38,30 @@ use winit::{
 };
 
 fn main() {
-    let instance = Instance::new(InstanceCreateInfo {
-        // Enable enumerating ports for surfaces, can be useful for debugging.
-        enumerate_portability: true,
-        ..Default::default()
-    })
+    let library = VulkanLibrary::new().unwrap();
+    let instance = Instance::new(
+        library,
+        InstanceCreateInfo {
+            // Enable enumerating ports for surfaces, can be useful for debugging.
+            enumerate_portability: true,
+            ..Default::default()
+        },
+    )
     .unwrap();
 
     let event_loop = EventLoop::new();
-    let surface = WindowBuilder::new()
-        .build_vk_surface(&event_loop, instance.clone())
-        .unwrap();
+    let window = Arc::new(WindowBuilder::new().build(&event_loop).unwrap());
+    let surface = create_surface_from_winit(window.clone(), instance.clone()).unwrap();
 
     let device_extensions = DeviceExtensions {
         khr_swapchain: true,
         ..DeviceExtensions::empty()
     };
-    let (physical_device, queue_family_index) =
-        physical::devices(instance.clone())
-            .unwrap()
-            .filter(|p| p.supported_extensions().contains(&device_extensions))
-            .filter_map(|p| {
+    let (physical_device, queue_family_index) = instance
+        .enumerate_physical_devices()
+        .unwrap()
+        .filter(|p| p.supported_extensions().contains(&device_extensions))
+        .filter_map(|p| {
                 p.queue_family_properties()
                     .iter()
                     .enumerate()
@@ -100,7 +104,7 @@ fn main() {
 
     let queue = queues.next().unwrap();
 
-    let (mut swapchain, images) = {
+    let (mut swapchain, mut images) = {
         let surface_capabilities = device
             .physical_device()
             .surface_capabilities(&surface, Default::default())
@@ -121,12 +125,18 @@ fn main() {
                 min_image_count: surface_capabilities.min_image_count,
                 image_format,
                 image_extent: window.inner_size().into(),
-                image_usage: ImageUsage::COLOR_ATTACHMENT,
-                composite_alpha: surface_capabilities
-                    .supported_composite_alpha
-                    .into_iter()
-                    .next()
-                    .unwrap(),
+                image_usage: ImageUsage {
+                    color_attachment: true,
+                    ..Default::default()
+                },
+                composite_alpha: {
+                    let alpha = surface_capabilities.supported_composite_alpha;
+                    if alpha.supports(vulkano::swapchain::CompositeAlpha::Opaque) {
+                        vulkano::swapchain::CompositeAlpha::Opaque
+                    } else {
+                        vulkano::swapchain::CompositeAlpha::Inherit
+                    }
+                },
                 ..Default::default()
             },
         )
@@ -200,11 +210,45 @@ fn main() {
                 )
                 .unwrap();
 
+                let render_pass = vulkano::single_pass_renderpass!(
+                    device.clone(),
+                    attachments: {
+                        color: {
+                            load: Clear,
+                            store: Store,
+                            format: swapchain.image_format(),
+                            samples: 1,
+                        }
+                    },
+                    pass: {
+                        color: [color],
+                        depth_stencil: {}
+                    }
+                )
+                .unwrap();
+
+                let framebuffers = images
+                    .iter()
+                    .map(|image| {
+                        let view = ImageView::new_default(image.clone()).unwrap();
+                        Framebuffer::new(
+                            render_pass.clone(),
+                            FramebufferCreateInfo {
+                                attachments: vec![view],
+                                ..Default::default()
+                            },
+                        )
+                        .unwrap()
+                    })
+                    .collect::<Vec<_>>();
+
                 builder
                     .begin_render_pass(
                         RenderPassBeginInfo {
                             clear_values,
-                            ..RenderPassBeginInfo::framebuffer(images[image_index as usize].clone())
+                            ..RenderPassBeginInfo::framebuffer(
+                                framebuffers[image_index as usize].clone(),
+                            )
                         },
                         SubpassContents::Inline,
                     )
