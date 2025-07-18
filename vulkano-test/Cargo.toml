@@ -4,6 +4,5 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-vulkano = { version = "*", default-features = true }
-vulkano-shaders = "*"
-winit = { version = "*", default-features = true }
+vulkano = "0.35.1"
+winit = "0.30"
