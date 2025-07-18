@@ -17,7 +17,7 @@ use vulkano::{
         RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
     },
     device::{
-        physical::{self, PhysicalDeviceType},
+        physical::{PhysicalDeviceType},
         Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags,
     },
     image::{view::ImageView, ImageUsage},
@@ -25,32 +25,44 @@ use vulkano::{
     render_pass::{Framebuffer, FramebufferCreateInfo},
     swapchain::{
         acquire_next_image, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
-        AcquireError,
     },
-    sync::{self, GpuFuture, FlushError},
-    VulkanLibrary,
+    sync::{self, GpuFuture},
+    VulkanError,
+    Validated,
+    library::VulkanLibrary,
 };
 use winit::{
     event::{Event, WindowEvent},
-    event_loop::{EventLoop, ControlFlow},
-    window::WindowBuilder,
+    event_loop::{ControlFlow, EventLoop},
+    window::Window,
 };
+use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 
 fn main() {
-    let library = VulkanLibrary::new().unwrap();
+    // Create the window
     let event_loop = EventLoop::new().unwrap();
-    let required_extensions = Surface::required_extensions(&event_loop).unwrap();
+    let mut window_attributes = winit::window::WindowAttributes::default();
+    window_attributes.title = "Vulkano Test".to_string();
+    let window = Arc::new(Window::new(&event_loop, window_attributes).unwrap());
+
+    // Create the Vulkan instance
+    let library = VulkanLibrary::new().unwrap();
     let instance = Instance::new(
         library,
         InstanceCreateInfo {
-            enabled_extensions: required_extensions,
+            enabled_extensions: Surface::required_extensions(&event_loop).unwrap(),
             ..Default::default()
         },
     )
     .unwrap();
 
-    let window = Arc::new(WindowBuilder::new().build(&event_loop).unwrap());
-    let surface = Surface::from_window(instance.clone(), window.clone()).unwrap();
+    // Create the Vulkan surface
+    let surface = unsafe {
+        Surface::from_window(
+            instance.clone(),
+            window.clone()
+        ).unwrap()
+    };
 
     let device_extensions = DeviceExtensions {
         khr_swapchain: true,
@@ -181,7 +193,7 @@ fn main() {
                 let (image_index, suboptimal, acquire_future) =
                     match acquire_next_image(swapchain.clone(), None) {
                         Ok(r) => r,
-                        Err(AcquireError::OutOfDate) => {
+                        Err(Validated::Error(VulkanError::OutOfDate)) => {
                             recreate_swapchain = true;
                             return;
                         }
@@ -207,6 +219,8 @@ fn main() {
                         color: {
                             format: swapchain.image_format(),
                             samples: 1,
+                            load_op: Clear,
+                            store_op: Store,
                         }
                     },
                     pass: {
@@ -266,7 +280,7 @@ fn main() {
                     Ok(future) => {
                         previous_frame_end = Some(future.boxed());
                     }
-                    Err(FlushError::OutOfDate) => {
+                    Err(Validated::Error(VulkanError::OutOfDate)) => {
                         recreate_swapchain = true;
                         previous_frame_end = Some(sync::now(device.clone()).boxed());
                     }
