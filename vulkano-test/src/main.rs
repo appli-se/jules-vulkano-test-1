@@ -13,75 +13,75 @@
 use std::sync::Arc;
 use vulkano::{
     command_buffer::{
-        allocator::StandardCommandBufferAllocator, CommandBufferUsage, RenderPassBeginInfo,
-        SubpassContents,
+        allocator::StandardCommandBufferAllocator, AutoCommandBufferBuilder, CommandBufferUsage,
+        RenderPassBeginInfo, SubpassBeginInfo, SubpassContents, SubpassEndInfo,
     },
     device::{
         physical::{self, PhysicalDeviceType},
-        Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo,
+        Device, DeviceCreateInfo, DeviceExtensions, QueueCreateInfo, QueueFlags,
     },
-    image::{view::ImageView, ImageAccess, ImageUsage, SwapchainImage},
+    image::{view::ImageView, ImageUsage},
     instance::{Instance, InstanceCreateInfo},
-    render_pass::{Framebuffer, FramebufferCreateInfo, RenderPass},
+    render_pass::{Framebuffer, FramebufferCreateInfo},
     swapchain::{
-        acquire_next_image, AcquireError, Swapchain, SwapchainCreateInfo, SwapchainCreationError,
-        SwapchainPresentInfo,
+        acquire_next_image, Surface, Swapchain, SwapchainCreateInfo, SwapchainPresentInfo,
+        AcquireError,
     },
-    sync::{self, FlushError, GpuFuture},
+    sync::{self, GpuFuture, FlushError},
     VulkanLibrary,
 };
-use vulkano_win::{create_surface_from_winit, VkSurfaceBuild};
 use winit::{
     event::{Event, WindowEvent},
-    event_loop::{ControlFlow, EventLoop},
-    window::{Window, WindowBuilder},
+    event_loop::{EventLoop, ControlFlow},
+    window::WindowBuilder,
 };
 
 fn main() {
     let library = VulkanLibrary::new().unwrap();
+    let event_loop = EventLoop::new().unwrap();
+    let required_extensions = Surface::required_extensions(&event_loop).unwrap();
     let instance = Instance::new(
         library,
         InstanceCreateInfo {
-            // Enable enumerating ports for surfaces, can be useful for debugging.
-            enumerate_portability: true,
+            enabled_extensions: required_extensions,
             ..Default::default()
         },
     )
     .unwrap();
 
-    let event_loop = EventLoop::new();
     let window = Arc::new(WindowBuilder::new().build(&event_loop).unwrap());
-    let surface = create_surface_from_winit(window.clone(), instance.clone()).unwrap();
+    let surface = Surface::from_window(instance.clone(), window.clone()).unwrap();
 
     let device_extensions = DeviceExtensions {
         khr_swapchain: true,
-        ..DeviceExtensions::empty()
+        ..Default::default()
     };
     let (physical_device, queue_family_index) = instance
         .enumerate_physical_devices()
         .unwrap()
         .filter(|p| p.supported_extensions().contains(&device_extensions))
         .filter_map(|p| {
-                p.queue_family_properties()
-                    .iter()
-                    .enumerate()
-                    .position(|(i, q)| {
-                        q.queue_flags.graphics && p.surface_support(i as u32, &surface).unwrap_or(false)
-                    })
-                    .map(|i| (p, i as u32))
-            })
-            .min_by_key(|(p, _)| {
-                // We assign a lower score to device types that are likely to be faster/better.
-                match p.properties().device_type {
-                    PhysicalDeviceType::DiscreteGpu => 0,
-                    PhysicalDeviceType::IntegratedGpu => 1,
-                    PhysicalDeviceType::VirtualGpu => 2,
-                    PhysicalDeviceType::Cpu => 3,
-                    PhysicalDeviceType::Other => 4,
-                    _ => 5,
-                }
-            })
-            .expect("no suitable physical device found");
+            p.queue_family_properties()
+                .iter()
+                .enumerate()
+                .position(|(i, q)| {
+                    q.queue_flags.contains(QueueFlags::GRAPHICS)
+                        && p.surface_support(i as u32, &surface).unwrap_or(false)
+                })
+                .map(|i| (p, i as u32))
+        })
+        .min_by_key(|(p, _)| {
+            // We assign a lower score to device types that are likely to be faster/better.
+            match p.properties().device_type {
+                PhysicalDeviceType::DiscreteGpu => 0,
+                PhysicalDeviceType::IntegratedGpu => 1,
+                PhysicalDeviceType::VirtualGpu => 2,
+                PhysicalDeviceType::Cpu => 3,
+                PhysicalDeviceType::Other => 4,
+                _ => 5,
+            }
+        })
+        .expect("no suitable physical device found");
 
     println!(
         "Using device: {} (type: {:?})",
@@ -90,7 +90,7 @@ fn main() {
     );
 
     let (device, mut queues) = Device::new(
-        physical_device,
+        physical_device.clone(),
         DeviceCreateInfo {
             enabled_extensions: device_extensions,
             queue_create_infos: vec![QueueCreateInfo {
@@ -109,14 +109,11 @@ fn main() {
             .physical_device()
             .surface_capabilities(&surface, Default::default())
             .unwrap();
-        let image_format = Some(
-            device
-                .physical_device()
-                .surface_formats(&surface, Default::default())
-                .unwrap()[0]
-                .0,
-        );
-        let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
+        let image_format = device
+            .physical_device()
+            .surface_formats(&surface, Default::default())
+            .unwrap()[0]
+            .0;
 
         Swapchain::new(
             device.clone(),
@@ -125,18 +122,12 @@ fn main() {
                 min_image_count: surface_capabilities.min_image_count,
                 image_format,
                 image_extent: window.inner_size().into(),
-                image_usage: ImageUsage {
-                    color_attachment: true,
-                    ..Default::default()
-                },
-                composite_alpha: {
-                    let alpha = surface_capabilities.supported_composite_alpha;
-                    if alpha.supports(vulkano::swapchain::CompositeAlpha::Opaque) {
-                        vulkano::swapchain::CompositeAlpha::Opaque
-                    } else {
-                        vulkano::swapchain::CompositeAlpha::Inherit
-                    }
-                },
+                image_usage: ImageUsage::COLOR_ATTACHMENT,
+                composite_alpha: surface_capabilities
+                    .supported_composite_alpha
+                    .into_iter()
+                    .next()
+                    .unwrap(),
                 ..Default::default()
             },
         )
@@ -144,17 +135,18 @@ fn main() {
     };
 
     let command_buffer_allocator =
-        StandardCommandBufferAllocator::new(device.clone(), Default::default());
+        Arc::new(StandardCommandBufferAllocator::new(device.clone(), Default::default()));
     let mut recreate_swapchain = false;
     let mut previous_frame_end = Some(sync::now(device.clone()).boxed());
 
-    event_loop.run(move |event, _, control_flow| {
+    event_loop.run(move |event, elwt| {
+        elwt.set_control_flow(ControlFlow::Poll);
         match event {
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 ..
             } => {
-                *control_flow = ControlFlow::Exit;
+                elwt.exit();
             }
             Event::WindowEvent {
                 event: WindowEvent::Resized(_),
@@ -162,25 +154,24 @@ fn main() {
             } => {
                 recreate_swapchain = true;
             }
-            Event::RedrawEventsCleared => {
-                let window = surface.object().unwrap().downcast_ref::<Window>().unwrap();
-                let dimensions = window.inner_size();
-                if dimensions.width == 0 || dimensions.height == 0 {
+            Event::WindowEvent {
+                event: WindowEvent::RedrawRequested,
+                ..
+            } => {
+                let image_extent: [u32; 2] = window.inner_size().into();
+                if image_extent.contains(&0) {
                     return;
                 }
 
                 previous_frame_end.as_mut().unwrap().cleanup_finished();
 
                 if recreate_swapchain {
-                    let (new_swapchain, new_images) =
-                        match swapchain.recreate(SwapchainCreateInfo {
-                            image_extent: dimensions.into(),
+                    let (new_swapchain, new_images) = swapchain
+                        .recreate(SwapchainCreateInfo {
+                            image_extent,
                             ..swapchain.create_info()
-                        }) {
-                            Ok(r) => r,
-                            Err(SwapchainCreationError::ImageExtentNotSupported { .. }) => return,
-                            Err(e) => panic!("failed to recreate swapchain: {e}"),
-                        };
+                        })
+                        .expect("failed to recreate swapchain");
 
                     swapchain = new_swapchain;
                     images = new_images;
@@ -203,8 +194,8 @@ fn main() {
 
                 let clear_values = vec![Some([0.0, 0.0, 1.0, 1.0].into())];
 
-                let mut builder = vulkano::command_buffer::AutoCommandBufferBuilder::primary(
-                    &command_buffer_allocator,
+                let mut builder = AutoCommandBufferBuilder::primary(
+                    command_buffer_allocator.clone(),
                     queue.queue_family_index(),
                     CommandBufferUsage::OneTimeSubmit,
                 )
@@ -214,8 +205,6 @@ fn main() {
                     device.clone(),
                     attachments: {
                         color: {
-                            load: Clear,
-                            store: Store,
                             format: swapchain.image_format(),
                             samples: 1,
                         }
@@ -250,10 +239,13 @@ fn main() {
                                 framebuffers[image_index as usize].clone(),
                             )
                         },
-                        SubpassContents::Inline,
+                        SubpassBeginInfo {
+                            contents: SubpassContents::Inline,
+                            ..Default::default()
+                        },
                     )
                     .unwrap()
-                    .end_render_pass()
+                    .end_render_pass(SubpassEndInfo::default())
                     .unwrap();
 
                 let command_buffer = builder.build().unwrap();
